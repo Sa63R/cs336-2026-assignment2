@@ -4,18 +4,19 @@ import argparse
 from contextlib import nullcontext
 import json
 import math
+from pathlib import Path
 import statistics
 import timeit
 
 import torch
 import torch.cuda.nvtx as nvtx
+from torch.utils.checkpoint import checkpoint
 from einops import einsum
 
 import cs336_basics.model as basics_model
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy, softmax
 from cs336_basics.optimizer import AdamW
-
 
 MODEL_CONFIGS = {
     "small": {
@@ -78,6 +79,17 @@ def parse_args() -> argparse.Namespace:
         help="启用 Nsight Systems 使用的 NVTX 标记",
     )
 
+    parser.add_argument(
+        "--memory-profile",
+        action="store_true",
+        help="记录 CUDA memory snapshot",
+    )
+    parser.add_argument(
+        "--memory-snapshot-path",
+        type=Path,
+        default=Path("memory_snapshot.pickle"),
+    )
+
     # 可以覆盖预设模型的参数，方便后面的实验。
     parser.add_argument("--d-model", type=int)
     parser.add_argument("--d-ff", type=int)
@@ -99,6 +111,12 @@ def parse_args() -> argparse.Namespace:
         "--mixed-precision",
         action="store_true",
         help="使用 BF16 autocast",
+    )
+    parser.add_argument(
+        "--checkpoint-block-size",
+        type=int,
+        default=0,
+        help="每个非嵌套 activation checkpoint 包含的 TransformerBlock 数量；0 表示禁用",
     )
 
     return parser.parse_args()
@@ -129,6 +147,44 @@ def synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def checkpointed_transformer_forward(
+    model: BasicsTransformerLM,
+    token_ids: torch.Tensor,
+    block_size: int,
+    use_nvtx: bool,
+) -> torch.Tensor:
+    """Run consecutive, non-nested groups of Transformer blocks under checkpoint."""
+    hidden_states = model.token_embeddings(token_ids)
+
+    for start in range(0, len(model.layers), block_size):
+        end = min(start + block_size, len(model.layers))
+
+        def run_block(
+            block_input: torch.Tensor,
+            start_idx: int = start,
+            end_idx: int = end,
+        ) -> torch.Tensor:
+            checkpoint_annotation = (
+                nvtx.range(f"checkpoint_blocks_{start_idx}_{end_idx}")
+                if use_nvtx
+                else nullcontext()
+            )
+            with checkpoint_annotation:
+                block_output = block_input
+                for layer_idx in range(start_idx, end_idx):
+                    block_output = model.layers[layer_idx](block_output)
+                return block_output
+
+        hidden_states = checkpoint(
+            run_block,
+            hidden_states,
+            use_reentrant=False,
+        )
+
+    hidden_states = model.ln_final(hidden_states)
+    return model.lm_head(hidden_states)
+
+
 def main() -> None:
     args = parse_args()
     config = resolve_model_config(args)
@@ -144,8 +200,18 @@ def main() -> None:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA 不可用")
 
+    if args.memory_profile and device.type != "cuda":
+        raise ValueError("memory profiler 只支持 CUDA")
+
     if args.mixed_precision and dtype != torch.float32:
         raise ValueError("混合精度实验应保留 FP32 模型参数，请使用 --dtype float32")
+
+    if args.checkpoint_block_size < 0:
+        raise ValueError("--checkpoint-block-size 必须大于等于 0")
+    if args.checkpoint_block_size > config["num_layers"]:
+        raise ValueError("--checkpoint-block-size 不能超过模型层数")
+    if args.checkpoint_block_size > 0 and args.mode == "forward":
+        raise ValueError("activation checkpointing 仅用于 forward_backward 或 full 模式")
 
     def precision_context():
         if args.mixed_precision:
@@ -212,7 +278,7 @@ def main() -> None:
         )
 
     model = model.to(dtype=dtype)
-    model.train()
+    model.train(args.mode != "forward")
 
     # 输入和标签只生成一次，并且放在 GPU 上。
     # 随机数生成和 CPU->GPU 传输不应该算进模型执行时间。
@@ -234,20 +300,34 @@ def main() -> None:
         lr=args.learning_rate,
     )
 
+    def model_forward(token_ids: torch.Tensor) -> torch.Tensor:
+        if args.checkpoint_block_size == 0:
+            return model(token_ids)
+        return checkpointed_transformer_forward(
+            model=model,
+            token_ids=token_ids,
+            block_size=args.checkpoint_block_size,
+            use_nvtx=args.nvtx,
+        )
+
     def prepare_step() -> None:
         # 清除上一轮梯度，但不把它计入 forward/backward 时间。
         if args.mode != "forward":
             optimizer.zero_grad(set_to_none=True)
 
     def run_step() -> torch.Tensor:
+        if args.mode == "forward":
+            with annotation("forward"):
+                with torch.no_grad(), precision_context():
+                    return model_forward(inputs)
+
         with annotation("forward"):
             with precision_context():
-                logits = model(inputs)
+                logits = model_forward(inputs)
                 loss = cross_entropy(logits, targets)
 
-        if args.mode in {"forward_backward", "full"}:
-            with annotation("backward"):
-                loss.backward()
+        with annotation("backward"):
+            loss.backward()
 
         if args.mode == "full":
             with annotation("optimizer_step"):
@@ -264,22 +344,38 @@ def main() -> None:
 
     timings_seconds: list[float] = []
 
-    with annotation("measurement"):
-        for _ in range(args.measurement_steps):
-            prepare_step()
+    synchronize(device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
-            # 确保前面提交的 CUDA 工作已经完成。
+    if args.memory_profile:
+        args.memory_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.cuda.memory._record_memory_history(max_entries=1_000_000)
+
+    try:
+        with annotation("measurement"):
+            for _ in range(args.measurement_steps):
+                prepare_step()
+
+                # 确保前面提交的 CUDA 工作已经完成。
+                synchronize(device)
+                start = timeit.default_timer()
+
+                value = run_step()
+
+                # CUDA 是异步的。必须等待 GPU 真正执行完成后再停止计时。
+                synchronize(device)
+                end = timeit.default_timer()
+
+                timings_seconds.append(end - start)
+                del value
+    finally:
+        if args.memory_profile:
             synchronize(device)
-            start = timeit.default_timer()
-
-            value = run_step()
-
-            # CUDA 是异步的。必须等待 GPU 真正执行完成后再停止计时。
-            synchronize(device)
-            end = timeit.default_timer()
-
-            timings_seconds.append(end - start)
-            del value
+            try:
+                torch.cuda.memory._dump_snapshot(str(args.memory_snapshot_path))
+            finally:
+                torch.cuda.memory._record_memory_history(enabled=None)
 
     timings_ms = [value * 1000 for value in timings_seconds]
     mean_ms = statistics.fmean(timings_ms)
@@ -290,12 +386,33 @@ def main() -> None:
         "mode": args.mode,
         "dtype": args.dtype,
         "mixed_precision": args.mixed_precision,
+        "checkpoint_block_size": args.checkpoint_block_size,
+        "num_checkpoint_segments": (
+            math.ceil(config["num_layers"] / args.checkpoint_block_size)
+            if args.checkpoint_block_size > 0
+            else 0
+        ),
         "device": str(device),
         "batch_size": args.batch_size,
         "context_length": args.context_length,
         "warmup_steps": args.warmup_steps,
         "measurement_steps": args.measurement_steps,
         "num_parameters": sum(p.numel() for p in model.parameters()),
+        "peak_memory_allocated_mib": (
+            torch.cuda.max_memory_allocated(device) / 2**20
+            if device.type == "cuda"
+            else None
+        ),
+        "peak_memory_reserved_mib": (
+            torch.cuda.max_memory_reserved(device) / 2**20
+            if device.type == "cuda"
+            else None
+        ),
+        "memory_snapshot_path": (
+            str(args.memory_snapshot_path)
+            if args.memory_profile
+            else None
+        ),
         "mean_ms": mean_ms,
         "std_ms": std_ms,
         "timings_ms": timings_ms,
