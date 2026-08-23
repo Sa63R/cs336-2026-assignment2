@@ -95,6 +95,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--mixed-precision",
+        action="store_true",
+        help="使用 BF16 autocast",
+    )
 
     return parser.parse_args()
 
@@ -138,6 +143,17 @@ def main() -> None:
 
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA 不可用")
+
+    if args.mixed_precision and dtype != torch.float32:
+        raise ValueError("混合精度实验应保留 FP32 模型参数，请使用 --dtype float32")
+
+    def precision_context():
+        if args.mixed_precision:
+            return torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+            )
+        return nullcontext()
 
     torch.manual_seed(args.seed)
     if device.type == "cuda":
@@ -225,8 +241,9 @@ def main() -> None:
 
     def run_step() -> torch.Tensor:
         with annotation("forward"):
-            logits = model(inputs)
-            loss = cross_entropy(logits, targets)
+            with precision_context():
+                logits = model(inputs)
+                loss = cross_entropy(logits, targets)
 
         if args.mode in {"forward_backward", "full"}:
             with annotation("backward"):
@@ -272,6 +289,7 @@ def main() -> None:
         "model_size": args.model_size,
         "mode": args.mode,
         "dtype": args.dtype,
+        "mixed_precision": args.mixed_precision,
         "device": str(device),
         "batch_size": args.batch_size,
         "context_length": args.context_length,
