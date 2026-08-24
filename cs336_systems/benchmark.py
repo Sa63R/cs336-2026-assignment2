@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+import csv
 import json
 import math
 from pathlib import Path
@@ -57,6 +58,30 @@ DTYPES = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
 }
+
+
+CSV_FIELDS = [
+    "model_size",
+    "mode",
+    "dtype",
+    "mixed_precision",
+    "compiled_model",
+    "checkpoint_block_size",
+    "device",
+    "batch_size",
+    "context_length",
+    "warmup_steps",
+    "measurement_steps",
+    "num_parameters",
+    "d_model",
+    "d_ff",
+    "num_layers",
+    "num_heads",
+    "mean_ms",
+    "std_ms",
+    "peak_memory_allocated_mib",
+    "peak_memory_reserved_mib",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,6 +143,21 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="每个非嵌套 activation checkpoint 包含的 TransformerBlock 数量；0 表示禁用",
     )
+    parser.add_argument(
+        "--compile-model",
+        action="store_true",
+        help="使用 torch.compile 编译整个 Transformer",
+    )
+    parser.add_argument(
+        "--csv-output",
+        type=Path,
+        help="将本次 benchmark 结果写入 CSV",
+    )
+    parser.add_argument(
+        "--append-csv",
+        action="store_true",
+        help="追加到 --csv-output，而不是覆盖文件",
+    )
 
     return parser.parse_args()
 
@@ -145,6 +185,25 @@ def resolve_model_config(args: argparse.Namespace) -> dict[str, int]:
 def synchronize(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def write_csv_result(
+    result: dict[str, object],
+    output_path: Path,
+    append: bool,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not append or not output_path.exists() or output_path.stat().st_size == 0
+
+    with output_path.open("a" if append else "w", newline="") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=CSV_FIELDS,
+            extrasaction="ignore",
+        )
+        if write_header:
+            writer.writeheader()
+        writer.writerow(result)
 
 
 def checkpointed_transformer_forward(
@@ -212,6 +271,10 @@ def main() -> None:
         raise ValueError("--checkpoint-block-size 不能超过模型层数")
     if args.checkpoint_block_size > 0 and args.mode == "forward":
         raise ValueError("activation checkpointing 仅用于 forward_backward 或 full 模式")
+    if args.compile_model and args.checkpoint_block_size > 0:
+        raise ValueError("--compile-model 暂不与 activation checkpointing 同时使用")
+    if args.append_csv and args.csv_output is None:
+        raise ValueError("--append-csv 必须与 --csv-output 一起使用")
 
     def precision_context():
         if args.mixed_precision:
@@ -279,6 +342,9 @@ def main() -> None:
 
     model = model.to(dtype=dtype)
     model.train(args.mode != "forward")
+
+    if args.compile_model:
+        model = torch.compile(model)
 
     # 输入和标签只生成一次，并且放在 GPU 上。
     # 随机数生成和 CPU->GPU 传输不应该算进模型执行时间。
@@ -386,6 +452,7 @@ def main() -> None:
         "mode": args.mode,
         "dtype": args.dtype,
         "mixed_precision": args.mixed_precision,
+        "compiled_model": args.compile_model,
         "checkpoint_block_size": args.checkpoint_block_size,
         "num_checkpoint_segments": (
             math.ceil(config["num_layers"] / args.checkpoint_block_size)
@@ -418,6 +485,13 @@ def main() -> None:
         "timings_ms": timings_ms,
         **config,
     }
+
+    if args.csv_output is not None:
+        write_csv_result(
+            result=result,
+            output_path=args.csv_output,
+            append=args.append_csv,
+        )
 
     print(json.dumps(result, indent=2))
 
