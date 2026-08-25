@@ -5,6 +5,99 @@ import torch
 import triton
 import triton.language as tl
 
+@torch.compile
+def flash_attention_backward(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    O: torch.Tensor,
+    dO: torch.Tensor,
+    L: torch.Tensor,
+    is_causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    head_dim = Q.shape[-1]
+    scale = 1.0 / math.sqrt(head_dim)
+
+    # D = rowsum(O ∘ dO)
+    # 使用 FP32 计算 reduction，增强数值稳定性。
+    D = torch.sum(
+        O.float() * dO.float(),
+        dim=-1,
+    )
+
+    # 式 (13)：S = QK^T / sqrt(d)
+    S = torch.matmul(
+        Q,
+        K.transpose(-1, -2),
+    )
+    S = S * scale
+
+    if is_causal:
+        num_queries = Q.shape[-2]
+        num_keys = K.shape[-2]
+
+        query_indices = torch.arange(
+            num_queries,
+            device=Q.device,
+        )
+        key_indices = torch.arange(
+            num_keys,
+            device=Q.device,
+        )
+
+        causal_mask = (
+            query_indices[:, None]
+            >= key_indices[None, :]
+        )
+
+        S = S.masked_fill(
+            ~causal_mask.unsqueeze(0),
+            -1.0e6,
+        )
+
+    # 式 (14)：使用 forward 保存的 L 重算 P。
+    # 这里没有再次调用 softmax。
+    P = torch.exp(
+        S.float() - L.float().unsqueeze(-1)
+    )
+
+    # 式 (15)：dV = P^T dO
+    # matmul 前转回输入类型，使 BF16 输入可以使用 Tensor Cores。
+    dV = torch.matmul(
+        P.to(dO.dtype).transpose(-1, -2),
+        dO,
+    )
+
+    # 式 (16)：dP = dO V^T
+    dP = torch.matmul(
+        dO,
+        V.transpose(-1, -2),
+    )
+
+    # 式 (17)：dS = P ∘ (dP - D)
+    dS = P * (
+        dP.float() - D.unsqueeze(-1)
+    )
+
+    # 让后续矩阵乘法使用输入的数据类型。
+    dS_for_matmul = dS.to(Q.dtype)
+
+    # 式 (18)：dQ = dS K / sqrt(d)
+    dQ = torch.matmul(
+        dS_for_matmul,
+        K,
+    )
+    dQ = dQ * scale
+
+    # 式 (19)：dK = dS^T Q / sqrt(d)
+    dK = torch.matmul(
+        dS_for_matmul.transpose(-1, -2),
+        Q,
+    )
+    dK = dK * scale
+
+    return dQ, dK, dV
+
 
 class FlashAttention2PyTorch(torch.autograd.Function):
     @staticmethod
@@ -133,9 +226,21 @@ class FlashAttention2PyTorch(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dO):
-        raise NotImplementedError(
-            "FlashAttention2PyTorch backward is implemented in a later task."
+        L, Q, K, V, O = ctx.saved_tensors
+
+        dQ, dK, dV = flash_attention_backward(
+            Q,
+            K,
+            V,
+            O,
+            dO,
+            L,
+            ctx.is_causal,
         )
+
+        # forward 有 Q、K、V、is_causal 四个输入。
+        # bool 参数没有梯度，所以最后返回 None。
+        return dQ, dK, dV, None
 
 
 @triton.jit
@@ -407,6 +512,16 @@ class FlashAttention2Triton(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dO):
-        raise NotImplementedError(
-            "The Triton backward kernel is implemented in the next task."
+        L, Q, K, V, O = ctx.saved_tensors
+
+        dQ, dK, dV = flash_attention_backward(
+            Q,
+            K,
+            V,
+            O,
+            dO,
+            L,
+            ctx.is_causal,
         )
+
+        return dQ, dK, dV, None
