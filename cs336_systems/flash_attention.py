@@ -2,7 +2,8 @@ import math
 
 import torch
 
-
+import triton
+import triton.language as tl
 
 
 class FlashAttention2PyTorch(torch.autograd.Function):
@@ -134,4 +135,278 @@ class FlashAttention2PyTorch(torch.autograd.Function):
     def backward(ctx, dO):
         raise NotImplementedError(
             "FlashAttention2PyTorch backward is implemented in a later task."
+        )
+
+
+@triton.jit
+def flash_fwd_kernel(
+    Q_ptr,
+    K_ptr,
+    V_ptr,
+    O_ptr,
+    L_ptr,
+    stride_qb,
+    stride_qq,
+    stride_qd,
+    stride_kb,
+    stride_kk,
+    stride_kd,
+    stride_vb,
+    stride_vk,
+    stride_vd,
+    stride_ob,
+    stride_oq,
+    stride_od,
+    stride_lb,
+    stride_lq,
+    N_QUERIES,
+    N_KEYS,
+    scale,
+    IS_CAUSAL: tl.constexpr,
+    D: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+):
+    # grid 的两个维度分别表示 query tile 和 batch。
+    query_tile_index = tl.program_id(0)
+    batch_index = tl.program_id(1)
+
+    Q_block_ptr = tl.make_block_ptr(
+        base=Q_ptr + batch_index * stride_qb,
+        shape=(N_QUERIES, D),
+        strides=(stride_qq, stride_qd),
+        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+
+    K_block_ptr = tl.make_block_ptr(
+        base=K_ptr + batch_index * stride_kb,
+        shape=(N_KEYS, D),
+        strides=(stride_kk, stride_kd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+
+    V_block_ptr = tl.make_block_ptr(
+        base=V_ptr + batch_index * stride_vb,
+        shape=(N_KEYS, D),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+
+    O_block_ptr = tl.make_block_ptr(
+        base=O_ptr + batch_index * stride_ob,
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+
+    L_block_ptr = tl.make_block_ptr(
+        base=L_ptr + batch_index * stride_lb,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(query_tile_index * Q_TILE_SIZE,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )
+
+    # 一个 program 只加载一个 query tile。
+    q = tl.load(Q_block_ptr)
+
+    # Online softmax 状态，全部使用 FP32。
+    row_max = tl.full(
+        (Q_TILE_SIZE,),
+        -float("inf"),
+        tl.float32,
+    )
+    row_sum = tl.zeros(
+        (Q_TILE_SIZE,),
+        tl.float32,
+    )
+    output_accumulator = tl.zeros(
+        (Q_TILE_SIZE, D),
+        tl.float32,
+    )
+
+    query_offsets = (
+        query_tile_index * Q_TILE_SIZE
+        + tl.arange(0, Q_TILE_SIZE)
+    )
+
+    # kernel 中唯一的循环：遍历 key/value tiles。
+    for key_start in range(0, N_KEYS, K_TILE_SIZE):
+        k = tl.load(K_block_ptr)
+        v = tl.load(V_block_ptr)
+
+        scores = tl.dot(
+            q,
+            tl.trans(k),
+            input_precision="ieee",
+        )
+        scores = scores * scale
+
+        if IS_CAUSAL:
+            key_offsets = (
+                key_start
+                + tl.arange(0, K_TILE_SIZE)
+            )
+
+            causal_mask = (
+                query_offsets[:, None]
+                >= key_offsets[None, :]
+            )
+
+            scores = tl.where(
+                causal_mask,
+                scores,
+                -float("inf"),
+            )
+
+        new_row_max = tl.maximum(
+            row_max,
+            tl.max(scores, axis=1),
+        )
+
+        old_scale = tl.exp(row_max - new_row_max)
+
+        probabilities = tl.exp(
+            scores - new_row_max[:, None]
+        )
+
+        row_sum = (
+            old_scale * row_sum
+            + tl.sum(probabilities, axis=1)
+        )
+
+        output_accumulator = (
+            output_accumulator
+            * old_scale[:, None]
+        )
+
+        # 将 probabilities 转成和 V 相同的数据类型后再做 dot。
+        probabilities = probabilities.to(v.dtype)
+
+        output_accumulator = tl.dot(
+            probabilities,
+            v,
+            acc=output_accumulator,
+            input_precision="ieee",
+        )
+
+        row_max = new_row_max
+
+        # 按题目要求，在循环末尾移动 block pointers。
+        K_block_ptr = tl.advance(
+            K_block_ptr,
+            (K_TILE_SIZE, 0),
+        )
+        V_block_ptr = tl.advance(
+            V_block_ptr,
+            (K_TILE_SIZE, 0),
+        )
+
+    output_accumulator = (
+        output_accumulator
+        / row_sum[:, None]
+    )
+    logsumexp = row_max + tl.log(row_sum)
+
+    # 写回 HBM 前转换为输出 tensor 的数据类型。
+    tl.store(
+        O_block_ptr,
+        output_accumulator.to(
+            O_block_ptr.type.element_ty
+        ),
+    )
+    tl.store(L_block_ptr, logsumexp)
+
+
+class FlashAttention2Triton(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        is_causal: bool = False,
+    ) -> torch.Tensor:
+        if not (Q.is_cuda and K.is_cuda and V.is_cuda):
+            raise ValueError(
+                "The Triton implementation requires CUDA tensors."
+            )
+
+        batch_size, num_queries, head_dim = Q.shape
+        num_keys = K.shape[-2]
+
+        if Q.shape[0] != K.shape[0] or Q.shape[0] != V.shape[0]:
+            raise ValueError("Q, K, and V must have the same batch size.")
+
+        if K.shape[-1] != head_dim or V.shape[-1] != head_dim:
+            raise ValueError("Q, K, and V must have the same head dimension.")
+
+        query_tile_size = 16
+        key_tile_size = 16
+
+        if num_queries % query_tile_size != 0:
+            raise ValueError(
+                "num_queries must be divisible by query_tile_size."
+            )
+
+        if num_keys % key_tile_size != 0:
+            raise ValueError(
+                "num_keys must be divisible by key_tile_size."
+            )
+
+        O = torch.empty_like(Q)
+
+        # L 按题目要求使用 FP32。
+        L = torch.empty(
+            (batch_size, num_queries),
+            device=Q.device,
+            dtype=torch.float32,
+        )
+
+        scale = 1.0 / math.sqrt(head_dim)
+
+        # (T_q, batch_size)
+        grid = (
+            triton.cdiv(num_queries, query_tile_size),
+            batch_size,
+        )
+
+        flash_fwd_kernel[grid](
+            Q,
+            K,
+            V,
+            O,
+            L,
+            *Q.stride(),
+            *K.stride(),
+            *V.stride(),
+            *O.stride(),
+            *L.stride(),
+            num_queries,
+            num_keys,
+            scale,
+            IS_CAUSAL=is_causal,
+            D=head_dim,
+            Q_TILE_SIZE=query_tile_size,
+            K_TILE_SIZE=key_tile_size,
+        )
+
+        ctx.is_causal = is_causal
+        ctx.save_for_backward(L, Q, K, V, O)
+
+        return O
+
+    @staticmethod
+    def backward(ctx, dO):
+        raise NotImplementedError(
+            "The Triton backward kernel is implemented in the next task."
         )
