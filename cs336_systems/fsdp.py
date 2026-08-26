@@ -105,6 +105,7 @@ class FullyShardedDataParallel(nn.Module):
                 master_shard=master_shard,
             )
             self._sharded_parameters.append(info)
+            # 这也是个字典，往上看就理解了
             self._sharded_by_parameter_id[id(parameter)] = info
 
         # Parameters and buffers not managed by FSDP remain replicated. Rank 0
