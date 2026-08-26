@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from cs336_systems.ddp import NaiveDDP
+from cs336_systems.ddp import OverlapDDP
 from cs336_systems.flash_attention import (
     FlashAttention2PyTorch,
     FlashAttention2Triton,
@@ -54,7 +54,7 @@ def get_ddp(module: torch.nn.Module) -> torch.nn.Module:
     Returns:
         Instance of a DDP class.
     """
-    return NaiveDDP(module)
+    return OverlapDDP(module)
 
 
 def ddp_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):

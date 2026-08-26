@@ -130,3 +130,45 @@ class FlatDDP(NaiveDDP):
             strict=True,
         ):
             original.copy_(synchronized)
+
+
+class OverlapDDP(NaiveDDP):
+    """Synchronize each parameter gradient asynchronously as it becomes ready."""
+
+    def __init__(self, module: nn.Module):
+        # NaiveDDP initializes the wrapper and broadcasts rank-0 model state.
+        super().__init__(module)
+
+        self._pending_works: list[dist.Work] = []
+        self._gradient_hook_handles = []
+
+        for parameter in self.module.parameters():
+            if not parameter.requires_grad:
+                continue
+
+            hook_handle = parameter.register_post_accumulate_grad_hook(
+                self._all_reduce_gradient
+            )
+            self._gradient_hook_handles.append(hook_handle)
+
+    def _all_reduce_gradient(self, parameter: nn.Parameter) -> None:
+        """Launch gradient averaging after this leaf's grad is accumulated."""
+        gradient = parameter.grad
+        if gradient is None:
+            return
+
+        # Pre-dividing is equivalent to dividing the summed gradient after the
+        # collective, and lets finish_gradient_synchronization only wait.
+        gradient.div_(dist.get_world_size())
+        work = dist.all_reduce(
+            gradient,
+            op=dist.ReduceOp.SUM,
+            async_op=True,
+        )
+        self._pending_works.append(work)
+
+    def finish_gradient_synchronization(self) -> None:
+        """Wait until every asynchronous all-reduce is safe to consume."""
+        for work in self._pending_works:
+            work.wait()
+        self._pending_works.clear()
