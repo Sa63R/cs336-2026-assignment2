@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import csv
 from datetime import timedelta
 import json
@@ -11,11 +12,12 @@ import statistics
 import time
 
 import torch
+import torch.cuda.nvtx as nvtx
 import torch.distributed as dist
 
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy
-from cs336_systems.ddp import FlatDDP, NaiveDDP
+from cs336_systems.ddp import FlatDDP, NaiveDDP, OverlapDDP
 
 
 MODEL_CONFIGS = {
@@ -65,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--strategy",
-        choices=["naive", "flat"],
+        choices=["naive", "flat", "overlap"],
         required=True,
     )
     parser.add_argument(
@@ -84,6 +86,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--measurement-steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--nvtx",
+        action="store_true",
+        help="Add NVTX ranges for Nsight Systems profiling",
+    )
     parser.add_argument(
         "--output",
         type=Path,
@@ -178,11 +185,12 @@ def main() -> None:
             )
         base_model = base_model.to(dtype=dtype)
 
-        model = (
-            NaiveDDP(base_model)
-            if args.strategy == "naive"
-            else FlatDDP(base_model)
-        )
+        ddp_classes = {
+            "naive": NaiveDDP,
+            "flat": FlatDDP,
+            "overlap": OverlapDDP,
+        }
+        model = ddp_classes[args.strategy](base_model)
         model.train()
 
         # 使用无状态的 SGD，避免 Adam 状态和 optimizer 计算掩盖通信差异。
@@ -213,8 +221,11 @@ def main() -> None:
             for parameter in trainable_parameters
         )
         all_reduce_calls = (
-            len(trainable_parameters) if args.strategy == "naive" else 1
+            1 if args.strategy == "flat" else len(trainable_parameters)
         )
+
+        def annotation(name: str):
+            return nvtx.range(name) if args.nvtx else nullcontext()
 
         def run_step() -> tuple[float, float]:
             optimizer.zero_grad(set_to_none=True)
@@ -224,19 +235,28 @@ def main() -> None:
             synchronize()
             iteration_start = time.perf_counter()
 
-            logits = model(inputs)
-            loss = cross_entropy(logits, targets)
-            loss.backward()
+            with annotation("training_iteration"):
+                with annotation("forward"):
+                    logits = model(inputs)
+                    loss = cross_entropy(logits, targets)
 
-            # 隔离 backward 与 gradient synchronization 的 GPU 时间。
-            synchronize()
-            communication_start = time.perf_counter()
-            model.finish_gradient_synchronization()
-            synchronize()
-            communication_end = time.perf_counter()
+                with annotation("backward"):
+                    loss.backward()
 
-            optimizer.step()
-            synchronize()
+                    # 对 overlap 实现而言，hooks 发起的 NCCL kernels 会和
+                    # backward kernels 一起在这一范围内完成；naive/flat
+                    # 尚未开始通信。同步也使后续 wait 阶段可单独计时。
+                    synchronize()
+
+                communication_start = time.perf_counter()
+                with annotation("gradient_sync"):
+                    model.finish_gradient_synchronization()
+                    synchronize()
+                communication_end = time.perf_counter()
+
+                with annotation("optimizer_step"):
+                    optimizer.step()
+                    synchronize()
             iteration_end = time.perf_counter()
 
             return (
@@ -250,10 +270,12 @@ def main() -> None:
         local_iteration_timings: list[float] = []
         local_communication_timings: list[float] = []
 
-        for _ in range(args.measurement_steps):
-            iteration_ms, communication_ms = run_step()
-            local_iteration_timings.append(iteration_ms)
-            local_communication_timings.append(communication_ms)
+        # Nsight 可用名为 profile 的 NVTX capture range 排除 warmup。
+        with annotation("profile"):
+            for _ in range(args.measurement_steps):
+                iteration_ms, communication_ms = run_step()
+                local_iteration_timings.append(iteration_ms)
+                local_communication_timings.append(communication_ms)
 
         iteration_timings = aggregate_rank_timings(
             local_iteration_timings,
