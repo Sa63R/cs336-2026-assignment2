@@ -5,6 +5,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 
 class NaiveDDP(nn.Module):
@@ -91,3 +92,41 @@ class NaiveDDP(nn.Module):
 
             # 将梯度和转换为所有 rank 梯度的平均值。
             gradient.div_(world_size)
+
+
+class FlatDDP(NaiveDDP):
+    """DDP variant that communicates all dense gradients in one all-reduce."""
+
+    def finish_gradient_synchronization(self) -> None:
+        gradients = [
+            parameter.grad
+            for parameter in self.module.parameters()
+            if parameter.grad is not None
+        ]
+
+        if not gradients:
+            return
+
+        # flatten 会分配一个连续 buffer，并把所有梯度复制到其中。
+        flat_gradient = _flatten_dense_tensors(gradients)
+
+        # 整个模型每个 training step 只发起一次 collective。
+        dist.all_reduce(
+            flat_gradient,
+            op=dist.ReduceOp.SUM,
+            async_op=False,
+        )
+        flat_gradient.div_(dist.get_world_size())
+
+        # unflatten 返回 flat buffer 的 views；optimizer 仍读取原来的
+        # parameter.grad，因此需要把同步后的值复制回原梯度 tensor。
+        synchronized_gradients = _unflatten_dense_tensors(
+            flat_gradient,
+            gradients,
+        )
+        for original, synchronized in zip(
+            gradients,
+            synchronized_gradients,
+            strict=True,
+        ):
+            original.copy_(synchronized)
