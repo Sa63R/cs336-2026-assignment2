@@ -7,6 +7,7 @@ from cs336_systems.flash_attention import (
     FlashAttention2PyTorch,
     FlashAttention2Triton,
 )
+from cs336_systems.sharded_optimizer import ShardedOptimizer
 
 
 def get_flashattention_autograd_function_pytorch() -> type:
@@ -36,6 +37,7 @@ def get_flashattention_autograd_function_triton() -> type:
     """
     # For example: return MyTritonFlashAttentionAutogradFunctionClass
     return FlashAttention2Triton
+
 
 def get_ddp(module: torch.nn.Module) -> torch.nn.Module:
     """
@@ -138,4 +140,4 @@ def get_sharded_optimizer(params, optimizer_cls: type[torch.optim.Optimizer], **
     Returns:
         Instance of sharded optimizer.
     """
-    raise NotImplementedError
+    return ShardedOptimizer(params, optimizer_cls, **kwargs)

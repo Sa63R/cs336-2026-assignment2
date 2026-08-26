@@ -92,6 +92,11 @@ def parse_args() -> argparse.Namespace:
         help="Add NVTX ranges for Nsight Systems profiling",
     )
     parser.add_argument(
+        "--nsys-capture",
+        action="store_true",
+        help="Bracket measurement with cudaProfilerStart/Stop for nsys",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path("profiles/ddp_flat_benchmark.csv"),
@@ -225,7 +230,8 @@ def main() -> None:
         )
 
         def annotation(name: str):
-            return nvtx.range(name) if args.nvtx else nullcontext()
+            use_nvtx = args.nvtx or args.nsys_capture
+            return nvtx.range(name) if use_nvtx else nullcontext()
 
         def run_step() -> tuple[float, float]:
             optimizer.zero_grad(set_to_none=True)
@@ -270,12 +276,19 @@ def main() -> None:
         local_iteration_timings: list[float] = []
         local_communication_timings: list[float] = []
 
-        # Nsight 可用名为 profile 的 NVTX capture range 排除 warmup。
+        # NVTX 给 trace 添加可读区间；CUDA Profiler API 只负责让 nsys
+        # 排除模型初始化和 warmup，二者职责不同。
+        if args.nsys_capture:
+            synchronize()
+            torch.cuda.cudart().cudaProfilerStart()
         with annotation("profile"):
             for _ in range(args.measurement_steps):
                 iteration_ms, communication_ms = run_step()
                 local_iteration_timings.append(iteration_ms)
                 local_communication_timings.append(communication_ms)
+        if args.nsys_capture:
+            synchronize()
+            torch.cuda.cudart().cudaProfilerStop()
 
         iteration_timings = aggregate_rank_timings(
             local_iteration_timings,
